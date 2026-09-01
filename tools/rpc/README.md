@@ -50,6 +50,8 @@ cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON
 cmake --build . --config Release
 ```
 
+GPU vendor support is independent of `-DGGML_RPC=ON` and of the transport (TCP or iroh, see below) -- it's selected the same way as any other `ggml-rpc-server`/`llama-cli` build: `-DGGML_CUDA=ON` for NVIDIA, `-DGGML_HIP=ON` for AMD (or no accelerator flag at all for a CPU-only build). Combine whichever vendor flag(s) you need with `-DGGML_RPC=ON`.
+
 When started, the `ggml-rpc-server` will detect and expose all available `CUDA` devices:
 
 ```bash
@@ -71,6 +73,32 @@ $ CUDA_VISIBLE_DEVICES=0 bin/ggml-rpc-server -p 50052
 $ bin/ggml-rpc-server --device CUDA0 -p 50052
 ```
 
+To build the `ggml-rpc-server` with support for AMD accelerators instead, use `-DGGML_HIP=ON`:
+
+```bash
+mkdir build-rpc-hip
+cd build-rpc-hip
+cmake .. -DGGML_HIP=ON -DGGML_RPC=ON
+cmake --build . --config Release
+```
+
+The HIP backend reuses the CUDA codepath under the hood, so devices are still reported as `ROCm0`, `ROCm1`, etc.:
+
+```bash
+$ bin/ggml-rpc-server
+Starting RPC server v3.0.0
+  endpoint       : 127.0.0.1:50052
+  local cache    : n/a
+Devices:
+  ROCm0: AMD Radeon RX 7900 XTX (24560 MiB, 24124 MiB free)
+```
+
+Similarly, you can control the set of exposed devices with `HIP_VISIBLE_DEVICES` or `--device`:
+```bash
+$ HIP_VISIBLE_DEVICES=0 bin/ggml-rpc-server -p 50052
+$ bin/ggml-rpc-server --device ROCm0 -p 50052
+```
+
 ### Main host
 
 On the main host build `llama.cpp` with the backends for the local devices and add `-DGGML_RPC=ON` to the build options.
@@ -85,7 +113,7 @@ You can override this behavior with the `--tensor-split` option and set custom p
 
 ### Automating node id exchange (iroh transport)
 
-When using the iroh transport (`GGML_RPC_TRANSPORT=iroh`), peers are identified by node id rather than host:port, so there's no fixed address to hardcode in advance. `coordinator.py` is a small stdlib-only rendezvous server that exchanges those ids; `ggml-rpc-server` and the driver binaries (`llama-cli`/`llama-server`/etc.) talk to it natively via `--rpc-rank`/`--rpc-coordinator` and `--rpc-world-size`/`--rpc-coordinator`, using a `RANK`/`WORLD_SIZE` convention (borrowed from MPI, not a llama.cpp concept -- the RPC backend itself has no notion of rank):
+When using the iroh transport (`GGML_RPC_TRANSPORT=iroh`), peers are identified by node id rather than host:port, so there's no fixed address to hardcode in advance. This is purely a transport-layer (networking) concern, independent of which GPU vendor (or none) the `ggml-rpc-server` binary was built for -- see [Remote hosts](#remote-hosts) above. `coordinator.py` is a small stdlib-only rendezvous server that exchanges those ids; `ggml-rpc-server` and the driver binaries (`llama-cli`/`llama-server`/etc.) talk to it natively via `--rpc-rank`/`--rpc-coordinator` and `--rpc-world-size`/`--rpc-coordinator`, using a `RANK`/`WORLD_SIZE` convention (borrowed from MPI, not a llama.cpp concept -- the RPC backend itself has no notion of rank):
 
 - `WORLD_SIZE` (`--rpc-world-size`, driver only): total number of processes (1 driver + N workers). Set to the same value on every machine.
 - `RANK` (`--rpc-rank`, worker only): an integer from `1` to `WORLD_SIZE - 1` inclusive, distinct for each worker (e.g. with `WORLD_SIZE=3` the two workers use `RANK=1` and `RANK=2`). The driver is implicitly rank 0 and doesn't pass `--rpc-rank`.

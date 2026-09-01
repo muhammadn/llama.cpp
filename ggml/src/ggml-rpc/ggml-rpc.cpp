@@ -2113,11 +2113,13 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         return;
     }
 
-#ifdef GGML_RPC_RDMA
+#ifdef GGML_RPC_TRANSPORT_IROH
+    printf("  transport      : iroh\n");
+#elif defined(GGML_RPC_RDMA)
     printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
 #else
     printf("  transport      : TCP\n");
-#endif // GGML_RPC_RDMA
+#endif
     if (!rpc_transport_init()) {
         fprintf(stderr, "Failed to initialize RPC transport\n");
         return;
