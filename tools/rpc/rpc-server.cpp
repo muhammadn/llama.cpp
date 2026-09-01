@@ -292,11 +292,16 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
         }
     }
 
-    // Try non-CPU devices first
+    // Try non-CPU devices first, skipping ACCEL devices (e.g. BLAS): they only
+    // implement a handful of ops and are meant to complement the CPU backend,
+    // not run standalone. The RPC client's supports_op() always returns true
+    // (see ggml_backend_rpc_device_supports_op), so an ACCEL device exposed
+    // over RPC has no fallback for the ops it can't handle and will abort.
     if (devices.empty()) {
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_CPU && type != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                 devices.push_back(dev);
             }
         }
