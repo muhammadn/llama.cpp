@@ -25,6 +25,13 @@ struct socket_t {
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
+    // Registers a callback fired exactly once, right before this (listening)
+    // socket becomes ready to accept a peer connection, with a
+    // transport-specific identity string (the iroh node id; unused on TCP,
+    // whose endpoint is already known to the caller before create_server()).
+    // Must be called on a server socket before its first accept().
+    void set_ready_callback(void (*cb)(const char * identity, void * user_data), void * user_data);
+
     static socket_ptr create_server(const char * host, int port);
     static socket_ptr connect(const char * host, int port);
 

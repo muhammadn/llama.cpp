@@ -620,6 +620,11 @@ void socket_t::update_caps(const uint8_t * remote_caps) {
     return pimpl->update_caps(remote_caps);
 }
 
+void socket_t::set_ready_callback(void (*)(const char *, void *), void *) {
+    // TCP's endpoint (host:port) is already known to the caller before
+    // create_server() is even called; there is nothing extra to report.
+}
+
 static bool is_valid_fd(sockfd_t sockfd) {
 #ifdef _WIN32
     return sockfd != INVALID_SOCKET;

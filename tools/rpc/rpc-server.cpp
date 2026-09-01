@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "http.h" // for common_http_client(); deliberately not linking the rest of libcommon
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
@@ -175,6 +176,13 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    // rendezvous with a coordinator.py instance (iroh transport only): once
+    // this server's node id is known, POST {rank, node_id} to
+    // <rpc_coordinator>/register. The bearer token, if the coordinator
+    // requires one, is read from the COORD_TOKEN environment variable only
+    // (never a CLI flag, since args are visible to any local user via `ps`).
+    std::string              rpc_coordinator;
+    int                      rpc_rank    = -1;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -186,6 +194,10 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  --rpc-coordinator URL             register this server's node id with a coordinator.py\n");
+    fprintf(stderr, "                                    instance (iroh transport only), requires --rpc-rank\n");
+    fprintf(stderr, "  --rpc-rank N                      this server's rank, used with --rpc-coordinator\n");
+    fprintf(stderr, "                                    (set COORD_TOKEN in the environment if the coordinator requires auth)\n");
     fprintf(stderr, "\n");
 }
 
@@ -233,6 +245,20 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--rpc-coordinator") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.rpc_coordinator = argv[i];
+        } else if (arg == "--rpc-rank") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.rpc_rank = std::stoi(argv[i]);
+            if (params.rpc_rank < 0) {
+                fprintf(stderr, "error: invalid rank: %d\n", params.rpc_rank);
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -287,6 +313,49 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
     return devices;
 }
 
+// Rendezvous with a coordinator.py instance: POST {"rank": rank, "node_id":
+// identity} to <coordinator_url>/register. Best-effort -- a failure is
+// logged but does not stop the server, since the node id is still printed
+// to stdout and can be exchanged manually.
+static void register_with_coordinator(const std::string & coordinator_url, int rank, const std::string & node_id) {
+    try {
+        auto [cli, parts] = common_http_client(coordinator_url);
+        cli.set_connection_timeout(10, 0);
+        cli.set_read_timeout(10, 0);
+        httplib::Headers headers;
+        if (const char * token = std::getenv("COORD_TOKEN"); token && token[0] != '\0') {
+            headers.emplace("Authorization", std::string("Bearer ") + token);
+        }
+        std::string path = parts.path;
+        if (!path.empty() && path.back() == '/') {
+            path.pop_back();
+        }
+        path += "/register";
+        std::string body = "{\"rank\":" + std::to_string(rank) + ",\"node_id\":\"" + node_id + "\"}";
+        auto res = cli.Post(path, headers, body, "application/json");
+        if (!res) {
+            fprintf(stderr, "coordinator: failed to reach %s: %s\n", coordinator_url.c_str(), httplib::to_string(res.error()).c_str());
+            return;
+        }
+        if (res->status != 200) {
+            fprintf(stderr, "coordinator: registration rejected (HTTP %d): %s\n", res->status, res->body.c_str());
+            return;
+        }
+        fprintf(stderr, "coordinator: registered rank %d -> %s\n", rank, node_id.c_str());
+    } catch (const std::exception & e) {
+        fprintf(stderr, "coordinator: registration failed: %s\n", e.what());
+    }
+}
+
+struct coordinator_ctx {
+    const rpc_server_params * params;
+};
+
+static void on_server_ready(const char * identity, void * user_data) {
+    auto * ctx = (coordinator_ctx *) user_data;
+    register_with_coordinator(ctx->params->rpc_coordinator, ctx->params->rpc_rank, identity);
+}
+
 int main(int argc, char * argv[]) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -295,6 +364,11 @@ int main(int argc, char * argv[]) {
     rpc_server_params params;
     if (!rpc_server_params_parse(argc, argv, params)) {
         fprintf(stderr, "Invalid parameters\n");
+        return 1;
+    }
+
+    if (params.rpc_coordinator.empty() != (params.rpc_rank < 0)) {
+        fprintf(stderr, "error: --rpc-coordinator and --rpc-rank must be given together\n");
         return 1;
     }
 
@@ -337,6 +411,14 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    coordinator_ctx ctx{&params};
+    void (*ready_cb)(const char *, void *) = nullptr;
+    void * ready_cb_user_data = nullptr;
+    if (!params.rpc_coordinator.empty()) {
+        ready_cb = on_server_ready;
+        ready_cb_user_data = &ctx;
+    }
+
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(), ready_cb, ready_cb_user_data);
     return 0;
 }

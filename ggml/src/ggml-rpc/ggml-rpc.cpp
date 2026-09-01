@@ -419,7 +419,7 @@ public:
     void event_record(ggml_backend_event_t event);
     void synchronize();
 
-    void start(const std::string & endpoint);
+    bool start(const std::string & endpoint);
     void work();
 
     ~rpc_dispatcher();
@@ -532,26 +532,31 @@ void rpc_dispatcher::synchronize() {
     msg->completion.get_future().wait();
 }
 
-void rpc_dispatcher::start(const std::string & endpoint) {
+bool rpc_dispatcher::start(const std::string & endpoint) {
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
-        GGML_ABORT("Failed to parse endpoint: %s\n", endpoint.c_str());
+        GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
+        return false;
     }
     if (!rpc_transport_init()) {
-        GGML_ABORT("RPC transport initialization failed\n");
+        GGML_LOG_ERROR("RPC transport initialization failed\n");
+        return false;
     }
 
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
-        GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+        GGML_LOG_ERROR("Failed to connect to %s\n", endpoint.c_str());
+        return false;
     }
     if (!negotiate_hello(sock)) {
-        GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+        GGML_LOG_ERROR("RPC handshake failed for %s\n", endpoint.c_str());
+        return false;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
     thread = std::thread(rpc_dispatcher_trampoline, this);
+    return true;
 }
 
 void rpc_dispatcher::work() {
@@ -595,7 +600,9 @@ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoi
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();
-    dispatcher->start(endpoint);
+    if (!dispatcher->start(endpoint)) {
+        return nullptr;
+    }
     dispatchers[endpoint] = dispatcher;
     return dispatcher;
 }
@@ -781,6 +788,9 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     rpc_msg_alloc_buffer_rsp response;
 
     auto dispatcher = get_dispatcher(buft_ctx->endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", buft_ctx->endpoint.c_str());
+    }
     dispatcher->send(RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), &response, sizeof(response));
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
@@ -884,6 +894,9 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
         rpc_msg_get_alloc_size_rsp response;
         auto dispatcher = get_dispatcher(buft_ctx->endpoint);
+        if (!dispatcher) {
+            GGML_ABORT("RPC connection to %s is no longer available\n", buft_ctx->endpoint.c_str());
+        }
         dispatcher->send(RPC_CMD_GET_ALLOC_SIZE, request, sizeof(*request), &response, sizeof(response));
 
         {
@@ -1068,6 +1081,9 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
         return it->second;
     }
     auto dispatcher = get_dispatcher(endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", endpoint);
+    }
     size_t alignment = get_alignment(dispatcher, device);
     size_t max_size = get_max_size(dispatcher, device);
     ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
@@ -1090,6 +1106,9 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
     auto dispatcher = get_dispatcher(endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", endpoint);
+    }
     ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {
         /* .dispatcher = */ dispatcher,
         /* .device     = */ device,
@@ -1111,6 +1130,9 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
 
 void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
     auto dispatcher = get_dispatcher(endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", endpoint);
+    }
     auto request = std::make_shared<rpc_msg_get_device_memory_req>();
     request->device = device;
     rpc_msg_get_device_memory_rsp response;
@@ -2050,7 +2072,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                   void (*ready_cb)(const char * identity, void * user_data), void * ready_cb_user_data) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
@@ -2103,6 +2126,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     if (server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
         return;
+    }
+    if (ready_cb) {
+        server_socket->set_ready_callback(ready_cb, ready_cb_user_data);
     }
     while (true) {
         auto client_socket = server_socket->accept();
@@ -2196,18 +2222,27 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
 static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
     auto dispatcher = get_dispatcher(ctx->endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", ctx->endpoint.c_str());
+    }
     return dispatcher->event_new(dev);
 }
 
 static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
     auto dispatcher = get_dispatcher(ctx->endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", ctx->endpoint.c_str());
+    }
     dispatcher->event_free(event);
 }
 
 static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
     auto dispatcher = get_dispatcher(ctx->endpoint);
+    if (!dispatcher) {
+        GGML_ABORT("RPC connection to %s is no longer available\n", ctx->endpoint.c_str());
+    }
     dispatcher->event_synchronize(event);
 }
 
@@ -2287,6 +2322,9 @@ ggml_backend_reg_t ggml_backend_rpc_reg(void) {
 
 static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
     auto dispatcher = get_dispatcher(endpoint);
+    if (!dispatcher) {
+        return 0;
+    }
     rpc_msg_device_count_rsp response;
     dispatcher->send(RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
     return response.device_count;

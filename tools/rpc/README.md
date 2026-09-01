@@ -83,6 +83,39 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+### Automating node id exchange (iroh transport)
+
+When using the iroh transport (`GGML_RPC_TRANSPORT=iroh`), peers are identified by node id rather than host:port, so there's no fixed address to hardcode in advance. `coordinator.py` is a small stdlib-only rendezvous server that exchanges those ids; `ggml-rpc-server` and the driver binaries (`llama-cli`/`llama-server`/etc.) talk to it natively via `--rpc-rank`/`--rpc-coordinator` and `--rpc-world-size`/`--rpc-coordinator`, using a `RANK`/`WORLD_SIZE` convention (borrowed from MPI, not a llama.cpp concept -- the RPC backend itself has no notion of rank):
+
+- `WORLD_SIZE` (`--rpc-world-size`, driver only): total number of processes (1 driver + N workers). Set to the same value on every machine.
+- `RANK` (`--rpc-rank`, worker only): an integer from `1` to `WORLD_SIZE - 1` inclusive, distinct for each worker (e.g. with `WORLD_SIZE=3` the two workers use `RANK=1` and `RANK=2`). The driver is implicitly rank 0 and doesn't pass `--rpc-rank`.
+
+Rank assignment is entirely manual -- nothing auto-detects or validates it. `coordinator.py` keeps one node id per rank; registering a rank twice with the *same* node id is a harmless no-op, but registering it with a *different* node id (e.g. two workers accidentally launched with the same rank) is rejected with `409` instead of silently overwriting the earlier registration. If you're reusing a long-lived coordinator process for a new launch, call `POST /reset` first to clear stale registrations from the previous run.
+
+Start a coordinator once, reachable by every driver/worker:
+```bash
+$ python3 tools/rpc/coordinator.py --host 0.0.0.0 --port 8765
+```
+Then on each worker, `-H` must still be passed explicitly (the iroh transport repurposes the "host" string as an optional decimal seed, and the binary's own default of `127.0.0.1` is not a valid seed):
+```bash
+$ ggml-rpc-server -H "" --rpc-coordinator http://<coordinator-host>:8765 --rpc-rank 1
+```
+And on the driver, once every worker has registered:
+```bash
+$ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 -p "..." \
+    --rpc-world-size 3 --rpc-coordinator http://<coordinator-host>:8765
+```
+`--rpc-world-size` (and `--rpc-coord-timeout`, if used) must be given before `--rpc-coordinator` on the command line, since the coordinator fetch happens as soon as `--rpc-coordinator` is parsed. Set `COORD_TOKEN` in the environment (same value on the coordinator, every worker, and the driver) if the coordinator requires auth -- see below. `--rpc-coord-timeout` (default: 300s) controls how long the driver waits for all workers to register.
+
+### Securing iroh connections
+
+The iroh transport encrypts and authenticates every connection at the transport level (QUIC/TLS 1.3, peers identified by public key), but by default any peer that knows a node id can connect to it and issue RPC requests -- there is no allowlist, and node ids are not secret (they get printed to stdout, passed on the command line, and exchanged in the clear by `coordinator.py`). Two opt-in env vars harden this:
+
+- `GGML_RPC_IROH_ALLOWED_PEERS` (set on `ggml-rpc-server`): comma-separated list of node ids allowed to connect. Any other peer is rejected before the RPC handshake. Unset (default): any peer is accepted, unchanged from before.
+- `COORD_TOKEN` (set identically on `coordinator.py`, every worker, and the driver): shared secret required as an `Authorization: Bearer <token>` header on all coordinator requests. Protects the node id exchange itself from anyone who can reach the coordinator's port. Read from the environment only, never a CLI flag, since arguments are visible to any local user via `ps`. Unset (default): no auth, unchanged from before.
+
+Both are optional and independent -- set neither for local/trusted-network use, or either/both when exposing peers over an untrusted network.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.

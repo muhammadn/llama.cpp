@@ -470,6 +470,11 @@ struct common_params {
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
+    // fetch the --rpc server list from a coordinator.py instance instead of
+    // specifying it directly; see --rpc-coordinator in common/arg.cpp
+    int32_t rpc_world_size    = 0;   // total RPC processes (1 driver + N-1 workers), 0 = unset
+    int32_t rpc_coord_timeout = 300; // seconds to wait for all workers to register
+
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs

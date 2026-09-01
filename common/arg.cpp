@@ -1177,8 +1177,52 @@ static void add_rpc_devices(const std::string & servers) {
     }
     for (const auto & server : rpc_servers) {
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
+        if (!reg) {
+            LOG_WRN("%s: failed to connect to RPC server %s, skipping\n", __func__, server.c_str());
+            continue;
+        }
         ggml_backend_register(reg);
     }
+}
+
+// Fetches the assembled --rpc connection string from a coordinator.py
+// instance (GET <url>/rpc?world_size=N&timeout=T, long-polls server-side
+// until all N-1 workers have registered or the timeout elapses) and feeds
+// it into add_rpc_devices(), as if it had been passed via --rpc directly.
+static void add_rpc_devices_from_coordinator(const std::string & url, int32_t world_size, int32_t timeout_s) {
+    if (world_size < 2) {
+        throw std::invalid_argument("--rpc-world-size must be >= 2 when using --rpc-coordinator");
+    }
+    common_remote_params params;
+    if (const char * token = std::getenv("COORD_TOKEN"); token && token[0] != '\0') {
+        params.headers.emplace_back("Authorization", std::string("Bearer ") + token);
+    }
+    // the coordinator's own long-poll timeout is world_size/timeout below;
+    // give our client socket a bit of slack so it doesn't time out first
+    params.timeout = timeout_s + 10;
+    std::string req_url = url + "/rpc?world_size=" + std::to_string(world_size) + "&timeout=" + std::to_string(timeout_s);
+    auto res = common_remote_get_content(req_url, params);
+    std::string body(res.second.begin(), res.second.end());
+    if (res.first != 200) {
+        std::string err;
+        try {
+            common_json response = common_json::parse(body);
+            if (response.contains("error")) {
+                err = response["error"].get<std::string>();
+            }
+        } catch (const std::exception &) {
+            // fall through with a generic message below
+        }
+        throw std::invalid_argument("RPC coordinator " + url + " returned HTTP " + std::to_string(res.first) +
+                                     (err.empty() ? "" : (": " + err)));
+    }
+    common_json response = common_json::parse(body);
+    if (!response.contains("rpc")) {
+        throw std::invalid_argument("RPC coordinator " + url + " returned an unexpected response: " + body);
+    }
+    std::string rpc_list = response["rpc"].get<std::string>();
+    LOG_INF("%s: fetched %d RPC peer(s) from coordinator %s\n", __func__, world_size - 1, url.c_str());
+    add_rpc_devices(rpc_list);
 }
 
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
@@ -2682,6 +2726,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 GGML_UNUSED(params);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--rpc-world-size"}, "N",
+            "total number of RPC processes (1 driver + N-1 workers), used with --rpc-coordinator.\n"
+            "must be given before --rpc-coordinator",
+            [](common_params & params, const std::string & value) {
+                params.rpc_world_size = std::stoi(value);
+            }
+        ).set_env("LLAMA_ARG_RPC_WORLD_SIZE"));
+        add_opt(common_arg(
+            {"--rpc-coord-timeout"}, "N",
+            string_format("seconds to wait for all RPC workers to register with the coordinator (default: %d).\n"
+                "must be given before --rpc-coordinator", params.rpc_coord_timeout),
+            [](common_params & params, const std::string & value) {
+                params.rpc_coord_timeout = std::stoi(value);
+            }
+        ).set_env("LLAMA_ARG_RPC_COORD_TIMEOUT"));
+        add_opt(common_arg(
+            {"--rpc-coordinator"}, "URL",
+            "fetch the --rpc server list from a coordinator.py instance instead of specifying it directly.\n"
+            "requires --rpc-world-size (and optionally --rpc-coord-timeout) to be given first (set COORD_TOKEN\n"
+            "in the environment if the coordinator requires auth)",
+            [](common_params & params, const std::string & value) {
+                add_rpc_devices_from_coordinator(value, params.rpc_world_size, params.rpc_coord_timeout);
+            }
+        ).set_env("LLAMA_ARG_RPC_COORDINATOR"));
     }
     add_opt(common_arg(
         {"--mlock"},
