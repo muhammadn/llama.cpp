@@ -590,13 +590,17 @@ rpc_dispatcher::~rpc_dispatcher() {
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<rpc_dispatcher>> dispatchers;
+    // Deliberately kept alive for the process lifetime (not weak_ptr): some
+    // callers (e.g. get_device_memory/get_alignment/get_max_size, used
+    // during early startup before any buffer exists) don't hold onto the
+    // returned dispatcher, which would otherwise tear down and reconnect on
+    // every such call. That's cheap on TCP but expensive/unreliable on the
+    // iroh transport (each reconnect is a fresh node identity + discovery).
+    static std::unordered_map<std::string, std::shared_ptr<rpc_dispatcher>> dispatchers;
 
     auto it = dispatchers.find(endpoint);
     if (it != dispatchers.end()) {
-        if (auto dispatcher = it->second.lock()) {
-            return dispatcher;
-        }
+        return it->second;
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();

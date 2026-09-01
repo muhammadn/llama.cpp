@@ -74,11 +74,16 @@ state = State()
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client (e.g. a long-polling GET /rpc) gave up and closed
+            # the connection before this response was ready -- nothing to do.
+            pass
 
     def _check_auth(self) -> bool:
         if not TOKEN:
