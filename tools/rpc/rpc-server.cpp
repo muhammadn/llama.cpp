@@ -12,8 +12,10 @@
 #  include <sys/stat.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <clocale>
 #include <codecvt>
+#include <csignal>
 #include <filesystem>
 #include <regex>
 #include <stdio.h>
@@ -356,9 +358,58 @@ struct coordinator_ctx {
     const rpc_server_params * params;
 };
 
+// Set (with release ordering) once on_server_ready() has registered with the
+// coordinator, so handle_shutdown_signal() knows there's something to undo
+// and can safely read the node id/rank/URL below it (acquire ordering).
+static std::atomic<bool> g_registered{false};
+static std::string       g_node_id;
+static std::string       g_coordinator_url;
+static int               g_rank = -1;
+
+// Best-effort, mirrors register_with_coordinator(): a failure here just
+// means the coordinator will keep a stale entry until the next /reset.
+static void unregister_with_coordinator(const std::string & coordinator_url, int rank, const std::string & node_id) {
+    try {
+        auto [cli, parts] = common_http_client(coordinator_url);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        httplib::Headers headers;
+        if (const char * token = std::getenv("COORD_TOKEN"); token && token[0] != '\0') {
+            headers.emplace("Authorization", std::string("Bearer ") + token);
+        }
+        std::string path = parts.path;
+        if (!path.empty() && path.back() == '/') {
+            path.pop_back();
+        }
+        path += "/unregister";
+        std::string body = "{\"rank\":" + std::to_string(rank) + ",\"node_id\":\"" + node_id + "\"}";
+        cli.Post(path, headers, body, "application/json");
+    } catch (const std::exception &) {
+        // best-effort, nothing to do
+    }
+}
+
+// NOTE: making an HTTP request from a signal handler isn't strictly
+// async-signal-safe, but this mirrors the rest of the coordinator glue
+// (best-effort, not held to hardened-service standards) and only runs once
+// on the way out. SIGKILL/taskkill /F can't be caught by any process, so
+// this only covers SIGINT (Ctrl-C) and SIGTERM (kill, docker stop, etc.).
+static void handle_shutdown_signal(int sig) {
+    if (g_registered.load(std::memory_order_acquire)) {
+        fprintf(stderr, "\ncoordinator: unregistering rank %d before exit\n", g_rank);
+        unregister_with_coordinator(g_coordinator_url, g_rank, g_node_id);
+    }
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
 static void on_server_ready(const char * identity, void * user_data) {
     auto * ctx = (coordinator_ctx *) user_data;
     register_with_coordinator(ctx->params->rpc_coordinator, ctx->params->rpc_rank, identity);
+    g_node_id          = identity;
+    g_coordinator_url  = ctx->params->rpc_coordinator;
+    g_rank             = ctx->params->rpc_rank;
+    g_registered.store(true, std::memory_order_release);
 }
 
 int main(int argc, char * argv[]) {
@@ -422,6 +473,8 @@ int main(int argc, char * argv[]) {
     if (!params.rpc_coordinator.empty()) {
         ready_cb = on_server_ready;
         ready_cb_user_data = &ctx;
+        std::signal(SIGINT, handle_shutdown_signal);
+        std::signal(SIGTERM, handle_shutdown_signal);
     }
 
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(), ready_cb, ready_cb_user_data);

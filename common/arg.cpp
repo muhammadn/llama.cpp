@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -1197,13 +1198,53 @@ static void add_rpc_devices_from_coordinator(const std::string & url, int32_t wo
     if (const char * token = std::getenv("COORD_TOKEN"); token && token[0] != '\0') {
         params.headers.emplace_back("Authorization", std::string("Bearer ") + token);
     }
-    // the coordinator's own long-poll timeout is world_size/timeout below;
-    // give our client socket a bit of slack so it doesn't time out first
-    params.timeout = timeout_s + 10;
-    std::string req_url = url + "/rpc?world_size=" + std::to_string(world_size) + "&timeout=" + std::to_string(timeout_s);
-    auto res = common_remote_get_content(req_url, params);
-    std::string body(res.second.begin(), res.second.end());
-    if (res.first != 200) {
+
+    // Poll with short-lived requests instead of holding one connection open
+    // for the whole timeout: some reverse proxies (e.g. Cloudflare) silently
+    // kill idle HTTP connections well before a long wait elapses, which
+    // would otherwise abort the whole wait on what's really a transient
+    // network hiccup. Each request asks the coordinator to long-poll for at
+    // most poll_s seconds; a 504 ("still waiting") or a dropped connection
+    // just means the next short poll is tried, until the overall deadline.
+    const int32_t poll_s = 10;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    std::string rpc_list;
+    for (;;) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) {
+            throw std::invalid_argument("RPC coordinator " + url + " timed out waiting for " +
+                                         std::to_string(world_size - 1) + " worker(s) to register");
+        }
+        const int32_t this_poll_s = (int32_t) std::min<decltype(remaining)>(poll_s, remaining);
+        // give our client socket a bit of slack so it doesn't time out first
+        params.timeout = this_poll_s + 5;
+        std::string req_url = url + "/rpc?world_size=" + std::to_string(world_size) + "&timeout=" + std::to_string(this_poll_s);
+
+        long status;
+        std::string body;
+        try {
+            auto res = common_remote_get_content(req_url, params);
+            status = res.first;
+            body = std::string(res.second.begin(), res.second.end());
+        } catch (const std::exception &) {
+            // transient network-level failure (connection reset/dropped by an
+            // intermediate proxy, etc.) -- try again until the deadline
+            continue;
+        }
+
+        if (status == 200) {
+            common_json response = common_json::parse(body);
+            if (!response.contains("rpc")) {
+                throw std::invalid_argument("RPC coordinator " + url + " returned an unexpected response: " + body);
+            }
+            rpc_list = response["rpc"].get<std::string>();
+            break;
+        }
+        if (status == 504) {
+            // coordinator's own "still waiting" response -- keep polling
+            continue;
+        }
+
         std::string err;
         try {
             common_json response = common_json::parse(body);
@@ -1213,14 +1254,10 @@ static void add_rpc_devices_from_coordinator(const std::string & url, int32_t wo
         } catch (const std::exception &) {
             // fall through with a generic message below
         }
-        throw std::invalid_argument("RPC coordinator " + url + " returned HTTP " + std::to_string(res.first) +
+        throw std::invalid_argument("RPC coordinator " + url + " returned HTTP " + std::to_string(status) +
                                      (err.empty() ? "" : (": " + err)));
     }
-    common_json response = common_json::parse(body);
-    if (!response.contains("rpc")) {
-        throw std::invalid_argument("RPC coordinator " + url + " returned an unexpected response: " + body);
-    }
-    std::string rpc_list = response["rpc"].get<std::string>();
+
     LOG_INF("%s: fetched %d RPC peer(s) from coordinator %s\n", __func__, world_size - 1, url.c_str());
     add_rpc_devices(rpc_list);
 }

@@ -19,6 +19,12 @@ catches two workers accidentally launched with the same RANK. Call
 POST /reset before starting a new launch on a coordinator process that is
 being reused (e.g. restarting a previous run).
 
+Workers may also call POST /unregister on shutdown to free their rank
+before the process exits (ggml-rpc-server does this on SIGINT/SIGTERM);
+this is a no-op if the rank isn't registered, and it will not remove a
+different worker's registration for the same rank (e.g. a fast restart
+that re-registered before the old process's shutdown request arrived).
+
 Usage:
     python3 coordinator.py [--host 127.0.0.1] [--port 8765]
 """
@@ -55,6 +61,14 @@ class State:
                 return existing
             self.node_ids[rank] = node_id
             return None
+
+    def unregister(self, rank: int, node_id: str) -> None:
+        """Remove a rank's registration, but only if it still matches
+        node_id, so a delayed/stale unregister can't clobber a newer
+        registration for the same rank."""
+        with self.lock:
+            if self.node_ids.get(rank) == node_id:
+                del self.node_ids[rank]
 
     def reset(self) -> None:
         with self.lock:
@@ -111,6 +125,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 })
                 return
             self.log_message("registered rank %d -> %s", rank, node_id)
+            self._send_json(200, {"ok": True})
+        elif self.path == "/unregister":
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+            rank = int(data["rank"])
+            node_id = str(data["node_id"])
+            state.unregister(rank, node_id)
+            self.log_message("unregistered rank %d (%s)", rank, node_id)
             self._send_json(200, {"ok": True})
         elif self.path == "/reset":
             state.reset()
